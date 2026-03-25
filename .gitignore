@@ -1,0 +1,18 @@
+# ESP-IDF build artifacts
+ESP32/source/firmware/build/
+ESP32/source/firmware/sdkconfig.old
+ESP32/source/firmware/managed_components/
+
+# VS Code
+.vscode/
+
+# claude
+.claude/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
