@@ -33,7 +33,9 @@
 #include "nvs_flash.h"
 #include "soc/rmt_reg.h"
 
-#define LED_GPIO 12
+// GPIO22: external LED output (active high).
+// Wire: GPIO22 → 330 Ω resistor → LED anode → LED cathode → GND.
+#define LED_GPIO 22
 #define PIN_SEL (1ULL << LED_GPIO)
 
 #define PRO_CON 0x03
@@ -73,6 +75,25 @@ static uint8_t report30[48] = {[0] = 0x00, [1] = 0x8E, [11] = 0x80};
 static uint8_t dummy[11] = {0x00, 0x8E, 0x00, 0x00, 0x00,
                             0x00, 0x08, 0x80, 0x00, 0x08, 0x80};
 
+/**
+ * Builds and sends one HID input report to the Switch over Bluetooth.
+ *
+ * Copies the current button/stick globals into the report30 buffer, then
+ * transmits it as a standard 0x30 input report. When paired/connected, reports
+ * are sent at ~15 ms intervals (~66 Hz). While not yet paired, a minimal
+ * neutral "dummy" report is sent at 100 ms intervals to keep the connection
+ * alive.
+ *
+ * Button globals (set these to control input):
+ *   but1_send  -- right buttons: Y(0) X(1) B(2) A(3) SR(4) SL(5) R(6) ZR(7)
+ *   but2_send  -- shared buttons: -(0) +(1) Rs(2) Ls(3) Home(4) Cap(5)
+ *   but3_send  -- left buttons:   D(0) U(1) R(2) L(3) SR(4) SL(5) L(6) ZL(7)
+ *   lx_send / ly_send  -- left stick X/Y  (0-255, center = 128)
+ *   cx_send / cy_send  -- right stick X/Y (0-255, center = 128)
+ *
+ * Must only be called from send_task. If modifying button globals from any
+ * other task, take xSemaphore before writing and release it after.
+ */
 void send_buttons() {
   xSemaphoreTake(xSemaphore, portMAX_DELAY);
   report30[0] = timer;
@@ -96,14 +117,30 @@ void send_buttons() {
   timer += 1;
   if (timer == 255) timer = 0;
 
+  // Flash LED while any button is held; restore it when all released.
+  static uint8_t prev_any_button = 0;
+  uint8_t any_button = but1_send | but2_send | but3_send;
+  if (any_button != prev_any_button) {
+    gpio_set_level(LED_GPIO, any_button ? 0 : 1);
+    prev_any_button = any_button;
+  }
+
   if (paired || connected) {
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                               sizeof(report30), report30);
-    vTaskDelay(15);
+    // If the BT stack is busy (a subcommand reply from intr_data_cb is in
+    // flight), skip this frame rather than colliding with it.
+    if (esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                      sizeof(report30), report30) != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(15));
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(15));
   } else {
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                               sizeof(dummy), dummy);
-    vTaskDelay(100);
+    if (esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                      sizeof(dummy), dummy) != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(15));
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
 
@@ -304,7 +341,21 @@ static uint8_t hid_descriptor[] = {
 };
 int hid_descriptor_len = sizeof(hid_descriptor);
 
-// sending bluetooth values every 15ms
+/**
+ * FreeRTOS task: drives the HID input report loop for the duration of a
+ * connection.
+ *
+ * Spawned by connection_cb when the Switch connects, deleted and re-spawned on
+ * each reconnect. Runs pinned to core 0 at priority 2.
+ *
+ * Startup sequence:
+ *   1. Presses SL+SR (Joy-Con) or L+R (Pro Con) for ~500 ms so the Switch's
+ *      "Change Grip/Order" screen accepts this controller.
+ *   2. Waits ~2 s with neutral reports while the Switch completes its
+ *      subcommand handshake (handled in intr_data_cb).
+ *   3. Enters the main input loop — replace the TEST block below with real
+ *      input logic (GPIO, SPI, etc.) that updates the button/stick globals.
+ */
 void send_task(void* pvParameters) {
   const char* TAG = "send_task";
   ESP_LOGI(TAG, "Sending hid reports on core %d\n", xPortGetCoreID());
@@ -323,9 +374,13 @@ void send_task(void* pvParameters) {
   xSemaphoreGive(xSemaphore);
 
   for (int i = 0; i < 33; i++) {  // ~500 ms at 15 ms/frame
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
-                                  sizeof(report30), report30);
-    vTaskDelay(15 / portTICK_PERIOD_MS);
+    if (esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                      sizeof(report30), report30) != ESP_OK) {
+      vTaskDelay(pdMS_TO_TICKS(15));
+      i--;  // retry this frame
+      continue;
+    }
+    vTaskDelay(pdMS_TO_TICKS(15));
   }
 
   xSemaphoreTake(xSemaphore, portMAX_DELAY);
@@ -333,12 +388,46 @@ void send_task(void* pvParameters) {
   report30[4] &= ~((1 << 6) | (1 << 5) | (1 << 4));
   xSemaphoreGive(xSemaphore);
 
+  // Wait for intr_data_cb to complete the subcommand handshake (paired=1).
+  //
+  // On a fresh pair the Switch sends SET_PLAYER_LIGHTS (0x30) which sets
+  // paired=1. On a reconnect the Switch skips the handshake — time out after
+  // 3 s and proceed anyway.
+  //
+  // We must keep sending neutral reports during this window so the Switch
+  // doesn't time out the connection. Reports are sent every 50 ms (instead of
+  // the normal 15 ms) to reduce contention with intr_data_cb reply sends.
+  {
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(3000);
+    while (!paired && xTaskGetTickCount() < deadline) {
+      esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30,
+                                    sizeof(dummy), dummy);
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (!paired) {
+      paired = 1;  // reconnect — Switch skipped handshake, safe to proceed
+    }
+  }
+
+  // TEST: repeatedly press A (physical Down on Joy-Con L sideways = bit0 of but3_send).
+  // Replace this loop with real input logic once confirmed working.
   while (1) {
-    send_buttons();
+    xSemaphoreTake(xSemaphore, portMAX_DELAY);
+    but3_send |= (1 << 0);   // press A
+    xSemaphoreGive(xSemaphore);
+    for (int i = 0; i < 20; i++) { send_buttons(); }  // hold ~300 ms
+
+    xSemaphoreTake(xSemaphore, portMAX_DELAY);
+    but3_send &= ~(1 << 0);  // release A
+    xSemaphoreGive(xSemaphore);
+    for (int i = 0; i < 313; i++) { send_buttons(); }  // gap ~4700 ms → ~5 s cycle
   }
 }
 
-// LED blink
+/**
+ * FreeRTOS task: blinks the LED while waiting for a connection.
+ * Deleted by connection_cb when the Switch connects.
+ */
 void startBlink() {
   while (1) {
     gpio_set_level(LED_GPIO, 0);
@@ -352,7 +441,15 @@ void startBlink() {
   }
   vTaskDelete(NULL);
 }
-// callback for hidd connection changes
+/**
+ * HID connection state callback.
+ * Called from hidd_event_cb on OPEN_EVT and CLOSE_EVT.
+ *
+ * On CONNECTED: stops the blink task, sets connected=true, and spawns
+ *   send_task to begin sending HID reports.
+ * On DISCONNECTED: restarts the blink task, clears paired/connected, and
+ *   makes the device connectable+discoverable again.
+ */
 void connection_cb(esp_bd_addr_t bd_addr, esp_hidd_connection_state_t state) {
   const char* TAG = "connection_cb";
 
@@ -425,7 +522,18 @@ void set_protocol_cb(uint8_t protocol) {
   ESP_LOGI(TAG, "got a set_protocol request from host");
 }
 
-// callback for when hid host sends interrupt data
+/**
+ * HID interrupt data callback — handles the Switch's subcommand handshake.
+ * Called from hidd_event_cb on INTR_DATA_EVT.
+ *
+ * The Switch drives pairing by sending a fixed sequence of subcommands
+ * (p_data[9] = subcommand ID). Each one is answered with a pre-built reply
+ * buffer. When SET_PLAYER_LIGHTS (0x30) or the NFC/IR config (0x21,0x21) is
+ * received, paired is set to 1 and send_task begins sending real input reports.
+ *
+ * Short packets (len < 10) are keepalive/rumble frames with no subcommand and
+ * are ignored.
+ */
 void intr_data_cb(uint8_t report_id, uint16_t len, uint8_t* p_data) {
   const char* TAG = "intr_data_cb";
   // switch pairing sequence
@@ -552,6 +660,14 @@ void vc_unplug_cb(void) {
   ESP_LOGI(TAG, "host did a virtual cable unplug");
 }
 
+/**
+ * Generates or restores a Nintendo-range Bluetooth MAC address (D4:F0:57:XX:XX:XX)
+ * and sets it as the base MAC for this device.
+ *
+ * On first boot the random suffix bytes are generated and persisted to NVS so
+ * the Switch always sees the same address on reconnect. To force a new address,
+ * uncomment the reset block inside this function.
+ */
 esp_err_t set_bt_address() {
   // store a random mac address in flash
   nvs_handle my_handle;
@@ -605,6 +721,17 @@ void print_bt_address() {
 static esp_hidd_app_param_t app_param;
 static esp_hidd_qos_param_t both_qos;
 
+/**
+ * Unified HID device event callback registered with esp_bt_hid_device_register_callback.
+ *
+ * Dispatches BT HID stack events to the appropriate handler:
+ *   INIT_EVT          -- BT HID stack ready; registers the HID app profile.
+ *   REGISTER_APP_EVT  -- HID profile registered; makes device discoverable.
+ *   OPEN_EVT          -- Switch opened a HID connection.
+ *   CLOSE_EVT         -- HID connection closed.
+ *   INTR_DATA_EVT     -- Switch sent a subcommand or input report.
+ *   SEND_REPORT_EVT   -- Acknowledgement after each send_report call (ignored).
+ */
 static void hidd_event_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
   const char* TAG = "hidd_event_cb";
   switch (event) {
@@ -705,17 +832,6 @@ void app_main() {
     //report30[2] += (0x3 << 1);
     //dummy[2] += (0x3 << 1);
   }
-  // flash LED
-  vTaskDelay(100);
-  gpio_set_level(LED_GPIO, 0);
-  vTaskDelay(100);
-  gpio_set_level(LED_GPIO, 1);
-  vTaskDelay(100);
-  gpio_set_level(LED_GPIO, 0);
-  vTaskDelay(100);
-  gpio_set_level(LED_GPIO, 1);
-  vTaskDelay(100);
-  gpio_set_level(LED_GPIO, 0);
 
   esp_err_t ret;
   static esp_bt_cod_t class;
@@ -730,6 +846,14 @@ void app_main() {
   io_conf.pull_up_en = 0;
   gpio_config(&io_conf);
   ESP_LOGI(TAG, "checkpoint 3: gpio configured");
+
+  // Startup flash: 3 quick blinks to confirm external LED is wired correctly.
+  for (int i = 0; i < 3; i++) {
+    gpio_set_level(LED_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(LED_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
 
   //一応名前とプロバイダーを純正と一緒にする ( For now, set these the same as a genuine product )
   app_param.name = "Wireless Gamepad";
