@@ -461,8 +461,10 @@ void connection_cb(esp_bd_addr_t bd_addr, esp_hidd_connection_state_t state) {
       esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 
       // clear blinking LED - solid
-      vTaskDelete(BlinkHandle);
-      BlinkHandle = NULL;
+      if (BlinkHandle != NULL) {
+        vTaskDelete(BlinkHandle);
+        BlinkHandle = NULL;
+      }
       gpio_set_level(LED_GPIO, 1);
       // start solid
       xSemaphoreTake(xSemaphore, portMAX_DELAY);
@@ -480,8 +482,11 @@ void connection_cb(esp_bd_addr_t bd_addr, esp_hidd_connection_state_t state) {
       ESP_LOGI(TAG, "connecting");
       break;
     case ESP_HIDD_CONN_STATE_DISCONNECTED:
-      xTaskCreate(startBlink, "blink_task", 1024, NULL, 1, &BlinkHandle);
-      // start blink
+      if (BlinkHandle != NULL) {
+        vTaskDelete(BlinkHandle);
+        BlinkHandle = NULL;
+      }
+      xTaskCreate(startBlink, "blink_task", 2048, NULL, 1, &BlinkHandle);
       ESP_LOGI(TAG, "disconnected from %02x:%02x:%02x:%02x:%02x:%02x",
                bd_addr[0], bd_addr[1], bd_addr[2], bd_addr[3], bd_addr[4],
                bd_addr[5]);
@@ -722,6 +727,26 @@ static esp_hidd_app_param_t app_param;
 static esp_hidd_qos_param_t both_qos;
 
 /**
+ * One-shot task: waits 10 s then makes the device connectable+discoverable.
+ *
+ * Spawned from REGISTER_APP_EVT so the BT callback is not blocked.
+ * Device is connectable (but not discoverable) immediately after registration,
+ * which allows the Switch to reconnect by MAC at any time. The 10-second delay
+ * gives the user time to open Change Grip/Order before the device becomes
+ * visible to the Switch's background scanner, preventing an incomplete bond.
+ */
+static void start_advertising_task(void *arg) {
+  const char *TAG = "start_advertising";
+  ESP_LOGI(TAG, "waiting 10 s before becoming discoverable "
+                "(open Change Grip/Order on Switch now)");
+  vTaskDelay(pdMS_TO_TICKS(10000));
+  ESP_LOGI(TAG, "now connectable+discoverable");
+  esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  xTaskCreate(startBlink, "blink_task", 2048, NULL, 2, &BlinkHandle);
+  vTaskDelete(NULL);
+}
+
+/**
  * Unified HID device event callback registered with esp_bt_hid_device_register_callback.
  *
  * Dispatches BT HID stack events to the appropriate handler:
@@ -745,9 +770,12 @@ static void hidd_event_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
       break;
     case ESP_HIDD_REGISTER_APP_EVT:
       if (param->register_app.status == ESP_HIDD_SUCCESS) {
-        ESP_LOGI(TAG, "REGISTER_APP_EVT: ok, going connectable+discoverable");
-        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-        xTaskCreate(startBlink, "blink_task", 1024, NULL, 2, &BlinkHandle);
+        // Connectable immediately so the Switch can reconnect by MAC at any time.
+        // Discoverable after a 10 s delay (via start_advertising_task) so the
+        // Switch's background scanner doesn't bond before the pairing screen opens.
+        ESP_LOGI(TAG, "REGISTER_APP_EVT: ok — connectable now, discoverable in 10 s");
+        esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+        xTaskCreate(start_advertising_task, "adv_task", 2048, NULL, 1, NULL);
       } else {
         ESP_LOGE(TAG, "REGISTER_APP_EVT: failed, status=%d", param->register_app.status);
       }
@@ -815,8 +843,25 @@ static void esp_bt_gap_cb(esp_bt_gap_cb_event_t event,
       }
       break;
     }
-
+    case ESP_BT_GAP_CFM_REQ_EVT:
+      // SSP numeric comparison — auto-confirm for "Just Works" pairing.
+      ESP_LOGI(SPP_TAG, "CFM_REQ_EVT: confirming passkey %" PRIu32,
+               param->cfm_req.num_val);
+      esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+      break;
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+      ESP_LOGI(SPP_TAG, "KEY_NOTIF_EVT: passkey %" PRIu32,
+               param->key_notif.passkey);
+      break;
+    case ESP_BT_GAP_KEY_REQ_EVT: {
+      // Legacy PIN request — send "0000".
+      ESP_LOGI(SPP_TAG, "KEY_REQ_EVT: sending PIN 0000");
+      esp_bt_pin_code_t pin = {'0', '0', '0', '0'};
+      esp_bt_gap_pin_reply(param->key_req.bda, true, 4, pin);
+      break;
+    }
     default:
+      ESP_LOGI(SPP_TAG, "gap unhandled event: %d", event);
       break;
   }
 }
